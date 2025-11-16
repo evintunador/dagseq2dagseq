@@ -32,6 +32,20 @@ class DummyGraph:
         return self.incoming.get(doc_id, [])
 
 
+class _FixedSeedRng:
+    """Deterministic RNG stub that always returns the same value for randrange."""
+
+    def __init__(self, value: int = 0) -> None:
+        self.value = value
+
+    def randrange(self, n: int) -> int:  # type: ignore[override]
+        return self.value % n
+
+    def random(self) -> float:  # type: ignore[override]
+        # Used by some traversal strategies; we keep it deterministic.
+        return 0.0
+
+
 def test_pack_batch_sampler_basic_properties():
     """Sampler should respect token budget and avoid duplicates within a pack."""
     graph = DummyGraph(
@@ -195,5 +209,89 @@ def test_pack_level_truncation_head_vs_tail():
     assert truncated_indices_tail == list(
         range(len(trimmed_tail) - len(truncated_indices_tail), len(trimmed_tail))
     )
+
+
+class _ChainStrategy:
+    """
+    Deterministic traversal strategy that walks along outgoing edges in a chain.
+
+    On each step it follows the first outgoing neighbor of the last document in
+    the local component's history, or stays on the same node if there are no
+    outgoing neighbors. The sampler is still responsible for de-duplicating
+    document ids at the pack level.
+    """
+
+    def reset_for_new_pack(self, graph, rng, first_doc_id) -> None:  # type: ignore[override]
+        del rng
+        self._graph = graph
+        self._start = first_doc_id
+
+    def propose_next(self, graph, rng, current_doc_ids):  # type: ignore[override]
+        del rng
+        last = current_doc_ids[-1] if current_doc_ids else self._start
+        neighbors = self._graph.neighbors_out(last)
+        return neighbors[0] if neighbors else last
+
+
+def test_iter_chain_no_truncation():
+    """A simple chain walk should include each doc once with full length."""
+    graph = DummyGraph(
+        token_lens={0: 3, 1: 3, 2: 3},
+        outgoing={0: [1], 1: [2], 2: []},
+        incoming={0: [], 1: [0], 2: [1]},
+    )
+
+    sampler = PackBatchSampler(
+        graph=graph,
+        strategy_factory=lambda: _ChainStrategy(),
+        token_budget=9,  # exactly enough for all three docs
+        doc_budget=None,
+        overflow_policy="truncate",
+        doc_level_trim_side="tail",
+        pack_level_trim_side="head",
+        seed=0,
+    )
+    sampler._rng = _FixedSeedRng(0)  # always pick doc 0 as the seed
+
+    pack = next(iter(sampler))
+    doc_ids = [p.doc_id for p in pack]
+    assert doc_ids == [0, 1, 2]
+    assert all(p.effective_len == 3 for p in pack)
+    assert all(not p.truncated for p in pack)
+
+
+def test_iter_respects_doc_budget_with_truncate():
+    """Iterating the sampler should apply doc-level truncation via doc_budget."""
+    graph = DummyGraph(
+        token_lens={0: 10, 1: 3},
+        outgoing={0: [1], 1: []},
+        incoming={0: [], 1: [0]},
+    )
+
+    sampler = PackBatchSampler(
+        graph=graph,
+        strategy_factory=lambda: _ChainStrategy(),
+        token_budget=20,
+        doc_budget=5,
+        overflow_policy="truncate",
+        doc_level_trim_side="tail",
+        pack_level_trim_side="head",
+        seed=0,
+    )
+    sampler._rng = _FixedSeedRng(0)  # ensure doc 0 is the seed
+
+    pack = next(iter(sampler))
+    doc_ids = [p.doc_id for p in pack]
+    assert doc_ids == [0, 1]
+
+    lengths = {p.doc_id: p.effective_len for p in pack}
+    truncated_flags = {p.doc_id: p.truncated for p in pack}
+
+    # Doc 0 is truncated down to the doc_budget; doc 1 fits in full.
+    assert lengths[0] == 5
+    assert truncated_flags[0] is True
+
+    assert lengths[1] == 3
+    assert truncated_flags[1] is False
 
 
