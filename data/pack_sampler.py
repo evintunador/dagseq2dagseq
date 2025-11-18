@@ -1,10 +1,11 @@
 import logging
 import random
 from dataclasses import dataclass
-from typing import Callable, Iterable, List, Optional, Set, Dict
+from typing import Callable, Dict, Iterable, List, Optional, Set
 
-from experiments.dagseq2dagseq.data.dataset import GraphIndex
-from experiments.dagseq2dagseq.data.traversal import TraversalStrategy
+from .dataset import GraphIndex
+from .traversal import TraversalStrategy
+from .layout import DocLayoutPolicy, NullLayoutPolicy
 
 
 logger = logging.getLogger(__name__)
@@ -78,6 +79,7 @@ class PackBatchSampler:
         max_candidates_per_component: int = 1000,
         seed: int = 0,
         order_mode: str = "as_traversed",
+        layout_policy: Optional[DocLayoutPolicy] = None,
     ) -> None:
         """
         Args:
@@ -86,9 +88,15 @@ class PackBatchSampler:
             strategy_factory: Callable that returns a fresh ``TraversalStrategy``
                 instance for each new graph walk / subgraph started in a pack.
             token_budget: Global maximum number of tokens allowed in a single
-                pack (typically ``batch_size * seq_len``).
+                pack (typically ``batch_size * seq_len``), counting *all*
+                tokens contributed by each document:
+
+                    prefix_length(doc) + body_length(doc) + suffix_length(doc)
+
+                Body length is tracked via ``DocPlacement.effective_len`` while
+                prefix/suffix lengths come from ``layout_policy``.
             doc_budget: Optional maximum number of tokens drawn from any single
-                document. ``None`` means "use the full document length".
+                document *body*. ``None`` means "use the full document body".
             overflow_policy: Behavior when ``full_len > doc_budget``:
                 - ``"skip"``: the document is never included in any pack.
                 - ``"truncate"``: the document may be included, but only up to
@@ -111,6 +119,10 @@ class PackBatchSampler:
                 - ``"as_traversed"``: keep insertion order.
                 - ``"prefer_targets_first"``: heuristic that prefers documents
                   that are linked-to to appear earlier than their linkers.
+            layout_policy: Policy that defines per-doc prefix and suffix
+                decorations. When ``None``, a ``NullLayoutPolicy`` is used,
+                preserving the historical behavior where documents contribute
+                only their body tokens.
         """
         if token_budget <= 0:
             raise ValueError(f"token_budget must be positive, got {token_budget}.")
@@ -146,6 +158,7 @@ class PackBatchSampler:
         self.pack_level_trim_side = pack_level_trim_side
         self.max_candidates_per_component = max_candidates_per_component
         self.order_mode = order_mode
+        self.layout_policy: DocLayoutPolicy = layout_policy or NullLayoutPolicy()
 
         self._rng = random.Random(seed)
 
@@ -214,7 +227,12 @@ class PackBatchSampler:
         Returns:
             placements: List of accepted ``DocPlacement`` objects in insertion
                 order, before any global ordering or pack-level truncation.
-            total_tokens: Sum of ``effective_len`` over the returned placements.
+            total_tokens: Total number of tokens contributed by all documents
+                in the pack, including per-doc prefix and suffix decorations:
+
+                    sum(prefix_len + body_len + suffix_len for each placement)
+
+                where ``body_len`` is ``DocPlacement.effective_len``.
         """
         placements: List[DocPlacement] = []
         pack_doc_ids: Set[int] = set()
@@ -241,10 +259,13 @@ class PackBatchSampler:
             if current_total_tokens >= self.token_budget:
                 break
 
-        # Filter out any placements that ended up with non-positive length
-        # (should not generally happen, but is safe).
         placements = [p for p in placements if p.effective_len > 0]
-        current_total_tokens = sum(p.effective_len for p in placements)
+        current_total_tokens = sum(
+            self.layout_policy.prefix_length(p.doc_id)
+            + p.effective_len
+            + self.layout_policy.suffix_length(p.doc_id)
+            for p in placements
+        )
         return placements, current_total_tokens
 
     def _seed_and_grow_subgraph(
@@ -292,6 +313,11 @@ class PackBatchSampler:
 
             # Accept seed.
             first_doc_id = candidate
+            
+            prefix_len = self.layout_policy.prefix_length(first_doc_id)
+            suffix_len = self.layout_policy.suffix_length(first_doc_id)
+            doc_total = prefix_len + per_doc_len + suffix_len
+
             placements.append(
                 DocPlacement(
                     doc_id=first_doc_id,
@@ -301,7 +327,7 @@ class PackBatchSampler:
                 )
             )
             pack_doc_ids.add(first_doc_id)
-            current_total_tokens += per_doc_len
+            current_total_tokens += doc_total
             seed_added = True
             break
 
@@ -313,9 +339,9 @@ class PackBatchSampler:
         strategy = self.strategy_factory()
         strategy.reset_for_new_pack(self.graph, self._rng, first_doc_id)
 
-        # Track the ids that belong to this subgraph/component. The sampler
-        # still enforces *pack*-level de-duplication via ``pack_doc_ids``, but
-        # the traversal strategy only sees the local history for this component.
+        # Track the ids that belong to this subgraph. The sampler still
+        # enforces *pack*-level de-duplication via ``pack_doc_ids``, but the
+        # traversal strategy only sees the local history for this subgraph.
         component_doc_ids: List[int] = [first_doc_id]
         attempts_without_accept = 0
 
@@ -341,6 +367,10 @@ class PackBatchSampler:
                 continue
 
             # Accept candidate.
+            prefix_len = self.layout_policy.prefix_length(candidate)
+            suffix_len = self.layout_policy.suffix_length(candidate)
+            doc_total = prefix_len + per_doc_len + suffix_len
+
             placements.append(
                 DocPlacement(
                     doc_id=candidate,
@@ -351,7 +381,7 @@ class PackBatchSampler:
             )
             pack_doc_ids.add(candidate)
             component_doc_ids.append(candidate)
-            current_total_tokens += per_doc_len
+            current_total_tokens += doc_total
 
             attempts_without_accept = 0
 
