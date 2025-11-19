@@ -200,7 +200,7 @@ if __name__ == "__main__":
     
     # Initialize Managers
     dist = DistributedManager()
-    rep = ReproducibilityManager(output_dir=run_dir)
+    rep = ReproducibilityManager(output_dir=run_dir, is_main_process=dist.is_main)
 
     with dist, rep:
         main(config, dist, rep)

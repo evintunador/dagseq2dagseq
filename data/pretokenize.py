@@ -21,6 +21,7 @@ import tiktoken
 from tqdm import tqdm
 
 from gpt_lab.data_sources.catalog_utils import BinaryShardIO
+from gpt_lab.distributed import is_main
 from gpt_lab.reproducibility import ReproducibilityManager
 from gpt_lab.logger import setup_experiment_logging
 
@@ -360,7 +361,10 @@ def main():
 
     # The ReproducibilityManager will handle creating a unique output directory,
     # capturing git state, and setting up file-based logging for the run.
-    with ReproducibilityManager(output_dir=str(args.runs_dir)) as rep:
+    with ReproducibilityManager(
+        output_dir=str(args.runs_dir), 
+        is_main_process=True
+    ) as rep:
         run_preprocessing(args, rep)
 
 

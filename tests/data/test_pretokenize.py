@@ -66,7 +66,7 @@ def test_pretokenize_script_with_tiktoken(dummy_pretokenize_input, tmpdir_factor
     )
     
     # Use the real ReproducibilityManager to mimic the actual script execution
-    with ReproducibilityManager(output_dir=str(runs_dir)) as rep:
+    with ReproducibilityManager(output_dir=str(runs_dir), is_main_process=True) as rep:
         # 2. Run the preprocessing logic
         run_preprocessing(args, rep)
         
