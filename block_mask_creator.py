@@ -73,7 +73,14 @@ from data.pack_sampler import PackBatchSampler
 from data.dataset import GraphIndex, PretokShardedBackend
 from data.layout import NullLayoutPolicy
 from data.collate import build_packed_batch, DocSpan
-from data.traversal import BFSStrategy
+from data.traversal import (
+    BFSStrategy,
+    DFSStrategy,
+    RandomWalkStrategy,
+    RandomSelectionStrategy,
+    CompositeTraversalStrategy
+)
+from cross_doc_mask import CrossDocLinkMaskCreator
 
 # =============================================================================
 # 1. Mask Logic
@@ -250,11 +257,33 @@ def create_doc_bidirectional_block_mask(tokens: torch.Tensor, doc_spans: List[An
 # Registry System
 # =============================================================================
 
+# Global instance for cross_doc_link (initialized when needed)
+_cross_doc_link_creator = None
+
+def create_cross_doc_link_mask(tokens: torch.Tensor, doc_spans: List[Any], **kwargs) -> BlockMask:
+    """
+    Creates a cross-document link-aware attention mask.
+    Tokens after markdown links [text](target) can attend to the target document.
+
+    Requires tiktoken to be installed.
+    """
+    global _cross_doc_link_creator
+
+    if _cross_doc_link_creator is None:
+        if tiktoken is None:
+            raise ImportError("tiktoken is required for cross_doc_link mask. Install with: pip install tiktoken")
+        enc = tiktoken.get_encoding('gpt2')
+        _cross_doc_link_creator = CrossDocLinkMaskCreator(tokenizer_decode_fn=enc.decode)
+
+    return _cross_doc_link_creator(tokens, doc_spans, **kwargs)
+
+
 MASK_CREATORS = {
     'doc_causal': create_doc_causal_block_mask,
     'causal': create_causal_block_mask,
     'full': create_full_attention_block_mask,
     'doc_bidirectional': create_doc_bidirectional_block_mask,
+    'cross_doc_link': create_cross_doc_link_mask,
 }
 
 
@@ -331,6 +360,9 @@ if __name__ == "__main__":
     parser.add_argument("--mask-type", type=str, default="doc_causal",
                         choices=list_mask_creators(),
                         help=f"Type of attention mask to create. Available: {', '.join(list_mask_creators())}")
+    parser.add_argument("--strategy", type=str, default="bfs",
+                        choices=['bfs', 'dfs', 'random_walk', 'random'],
+                        help="Graph traversal strategy (bfs=breadth-first, dfs=depth-first, random_walk=Markov walk, random=uniform random)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for batch selection")
     parser.add_argument("--token-budget", type=int, default=16_384, help="Max tokens per batch")
     parser.add_argument("--doc-budget", type=int, default=4096, help="Max tokens per document")
@@ -349,10 +381,19 @@ if __name__ == "__main__":
     backend = PretokShardedBackend(graph_index)
     
     # 2. Setup Sampler
-    logger.info(f"Initializing sampler with seed {args.seed}...")
+    logger.info(f"Initializing sampler with seed {args.seed} and strategy {args.strategy}...")
+
+    # Map strategy name to factory function
+    strategy_factories = {
+        'bfs': lambda: BFSStrategy(edge_mode="outgoing"),
+        'dfs': lambda: DFSStrategy(edge_mode="outgoing"),
+        'random_walk': lambda: RandomWalkStrategy(restart_prob=0.15, edge_mode="outgoing"),
+        'random': lambda: RandomSelectionStrategy(),
+    }
+
     pack_sampler = PackBatchSampler(
         graph=graph_index,
-        strategy_factory=lambda: BFSStrategy(edge_mode="outgoing"),
+        strategy_factory=strategy_factories[args.strategy],
         token_budget=args.token_budget,
         doc_budget=args.doc_budget,
         seed=args.seed,
@@ -421,6 +462,12 @@ if __name__ == "__main__":
     elif args.mask_type == 'doc_bidirectional':
         # Same document only (bidirectional within docs)
         dense_mask = doc_map.unsqueeze(1) == doc_map.unsqueeze(0)
+    elif args.mask_type == 'cross_doc_link':
+        # Use the EXACT same logic as the mask creator by calling its visualization method
+        # This ensures 100% consistency between visualization and actual mask
+        dense_mask = _cross_doc_link_creator.build_dense_mask_for_visualization(
+            tokens, doc_spans, device=torch.device('cpu')
+        )
     else:
         # Fallback: try to reconstruct generically (might not match all custom masks)
         logger.warning(f"No specific visualization logic for mask type '{args.mask_type}'. Using full attention as fallback.")
