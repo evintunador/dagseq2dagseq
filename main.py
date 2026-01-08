@@ -13,9 +13,10 @@ from tunalab.distributed import DistributedManager
 from tunalab.reproducibility import ReproducibilityManager
 from tunalab import tracking
 from tunalab.smart_train import smart_train
-from tunalab.modules.training_module import DS2DSTrainingModule
 
-# Local imports (from demo_traversal.py)
+# Local imports
+from tunalab.nn_modules.training_module import DS2DSTrainingModule
+from block_mask_creator import make_mask_creator_callable
 from data.dataset import GraphIndex, PretokShardedBackend, PackedSequenceDataset
 from data.layout import BOSEOSLayoutPolicy, NullLayoutPolicy
 from data.pack_sampler import PackBatchSampler
@@ -77,9 +78,14 @@ def main(cfg: Dict[str, Any], dist: DistributedManager, rep: ReproducibilityMana
 
     # Configure Layout Policy (BOS/EOS wrapping)
     if cfg.get('data', {}).get('use_bos_eos', False):
-        # TODO: These IDs should ideally come from the tokenizer used to create the dataset
-        bos_id = cfg.get('data', {}).get('bos_token_id', 1)
-        eos_id = cfg.get('data', {}).get('eos_token_id', 2)
+        # GPT-2 uses 50256 as <|endoftext|> for both BOS and EOS
+        tokenizer_name = graph_index.metadata.get('tokenizer', 'gpt2')
+        if tokenizer_name == 'gpt2':
+            bos_id = 50256  # GPT-2 <|endoftext|>
+            eos_id = 50256
+        else:
+            bos_id = cfg.get('data', {}).get('bos_token_id', 1)
+            eos_id = cfg.get('data', {}).get('eos_token_id', 2)
         layout_policy = BOSEOSLayoutPolicy(bos_token_id=bos_id, eos_token_id=eos_id)
     else:
         layout_policy = NullLayoutPolicy()
@@ -130,49 +136,76 @@ def main(cfg: Dict[str, Any], dist: DistributedManager, rep: ReproducibilityMana
     train_loader = DataLoader(
         dataset,
         batch_size=None, 
-        num_workers=0, # TODO: Experiment with multiprocessing
+        num_workers=0,  # Can experiment with multiprocessing later
     )
 
     # -------------------------------------------------------------------------
-    # 3. Model & Optimizer Setup (TEMPLATE)
+    # 3. Model & Optimizer Setup
     # -------------------------------------------------------------------------
-    # logger.info("Initializing Model...")
-    model = DS2DSTrainingModule(**cfg['model'].to(dist.device)
+    logger.info("Initializing Model...")
+    
+    # Get vocab size from tokenizer metadata
+    tokenizer_name = graph_index.metadata.get('tokenizer', 'gpt2')
+    vocab_size = 50257 if tokenizer_name == 'gpt2' else cfg['model'].get('vocab_size', 50257)
+    
+    # Create block mask creator
+    mask_type = cfg.get('model', {}).get('mask_type', 'doc_causal')
+    block_mask_creator = make_mask_creator_callable(mask_type)
+    
+    # Build model
+    model = DS2DSTrainingModule(
+        block_mask_creator=block_mask_creator,
+        vocab_size=vocab_size,
+        num_layers=cfg['model']['num_layers'],
+        model_dim=cfg['model']['model_dim'],
+        num_heads=cfg['model']['num_heads'],
+        max_seq_len=cfg['model']['max_seq_len'],
+        dropout=cfg['model'].get('dropout', 0.0),
+        drop_path_rate=cfg['model'].get('drop_path_rate', 0.0),
+        fp8=cfg['model'].get('fp8', False),
+        weight_tying=cfg['model'].get('weight_tying', True),
+        ignore_index=cfg['model'].get('ignore_index', -100),
+        dtype=getattr(torch, cfg['model'].get('dtype', 'bfloat16')),
+    ).to(dist.device)
+    
     if cfg['model']['compile']:
+        logger.info("Compiling model with torch.compile...")
         model = torch.compile(
             model,
             dynamic=False,
             mode=cfg['model']['compile_mode'],
         )
     
-    # optimizer = torch.optim.AdamW(
-    #     model.parameters(), 
-    #     lr=cfg['training']['learning_rate'],
-    #     betas=(cfg['optimizer']['beta1'], cfg['optimizer']['beta2']),
-    #     weight_decay=cfg['optimizer']['weight_decay']
-    # )
+    logger.info("Initializing Optimizer...")
+    optimizer = torch.optim.AdamW(
+        model.parameters(), 
+        lr=cfg['optimizer']['max_lr'],
+        betas=(cfg['optimizer'].get('beta1', 0.9), cfg['optimizer'].get('beta2', 0.95)),
+        weight_decay=cfg['optimizer']['wd']
+    )
 
     # -------------------------------------------------------------------------
-    # 4. Training Loop (TEMPLATE)
+    # 4. Training Loop
     # -------------------------------------------------------------------------
-    # logger.info("Starting Training...")
+    logger.info("Starting Training...")
     
-    # atomic_feature_kwargs = cfg['training'].get('atomic_feature_kwargs', {})
-    # atomic_feature_kwargs.update({
-    #     'enable_logging': True,
-    #     'output_dir': rep.output_dir,
-    #     'device': dist.device,
-    #     "use_tqdm": True,
-    # })
+    atomic_feature_kwargs = cfg.get('train_loop', {}).get('atomic_feature_kwargs', {})
+    atomic_feature_kwargs.update({
+        'enable_logging': True,
+        'output_dir': rep.output_dir,
+        'device': dist.device,
+        'use_tqdm': True,
+        'max_epochs': cfg['train_loop'].get('epochs', 1),
+    })
 
-    # result = smart_train(
-    #     model=model, 
-    #     optimizer=optimizer, 
-    #     train_loader=train_loader, 
-    #     **atomic_feature_kwargs
-    # )
+    result = smart_train(
+        model=model, 
+        optimizer=optimizer, 
+        train_loader=train_loader, 
+        **atomic_feature_kwargs
+    )
     
-    logger.info("Setup complete. Training loop is currently commented out.")
+    logger.info("Training complete!")
     
     # Cleanup
     backend.close()

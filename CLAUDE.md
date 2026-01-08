@@ -40,7 +40,10 @@ python demo_traversal.py <pretokenized_dataset_path> --strategy random_walk --to
 
 ### Training
 ```bash
-# Run training (currently a template with model setup but training loop commented out)
+# Run training with default config
+python main.py --dataset-dir data/pretokenized_datasets/simplewiki_full
+
+# Run with custom settings
 python main.py --dataset-dir <pretokenized_dataset_path> --strategy random_walk --max-seq-len 2048
 ```
 
@@ -136,7 +139,7 @@ External dependencies include PyTorch, NumPy, tiktoken (for tokenization), and t
 ## File Structure
 
 ```
-├── main.py                          # Training entry point (template)
+├── main.py                          # Training entry point
 ├── demo_traversal.py                # Inspection tool for packed batches
 ├── block_mask_creator.py            # Custom attention mask logic
 ├── tunalab.yaml                     # Experiment config

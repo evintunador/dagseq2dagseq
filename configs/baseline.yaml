@@ -1,14 +1,29 @@
 data:
-  strategy: 
+  strategy: 'random'  # Options: random, random_walk, bfs, dfs
+  use_bos_eos: false
+  order_mode: 'prefer_targets_first'  # Options: as_traversed, prefer_targets_first
+  doc_budget: null  # Optional per-document token limit (null = no limit)
 
 model:
-  compile: True
+  compile: true
   compile_mode: 'default'
-  embed_dim: 
+  mask_type: 'doc_causal'  # Options: doc_causal, causal, full, doc_bidirectional, cross_doc_link
+  model_dim: 768  # Embedding dimension (GPT-2 small uses 768)
+  num_layers: 12  # Number of transformer layers
+  num_heads: 12  # Number of attention heads
+  max_seq_len: 2048  # Maximum sequence length / context window
+  dropout: 0.1
+  drop_path_rate: 0.0
+  fp8: false
+  weight_tying: true  # Tie embedding and output weights
+  ignore_index: -100
+  dtype: 'bfloat16'
 
 optimizer:
-  type: 'adamw' # 'adamw' or 'muon'
+  type: 'muon'  # 'adamw' or 'muon'
   wd: 0.1
+  beta1: 0.9
+  beta2: 0.95
   init_lr: 0.000001
   warmup_pct: 0.01
   max_lr: 0.001
@@ -18,3 +33,6 @@ optimizer:
 
 train_loop: 
   epochs: 1
+  atomic_feature_kwargs: {}  # Additional training loop arguments
+
+seed: 42

@@ -19,10 +19,18 @@ To see how the graph traversal works and what the packed batches look like:
 python experiments/dagseq2dagseq/demo_traversal.py /path/to/pretokenized/dataset --strategy random_walk
 ```
 
-### Training (Template)
+### Training
 
-To run the training script (once configured):
+To run the training script:
 
 ```bash
-python experiments/dagseq2dagseq/main.py --dataset-dir /path/to/pretokenized/dataset
+# Using default config
+python experiments/dagseq2dagseq/main.py --dataset-dir data/pretokenized_datasets/simplewiki_full
+
+# With custom settings
+python experiments/dagseq2dagseq/main.py \
+  --dataset-dir data/pretokenized_datasets/simplewiki_full \
+  --strategy random_walk \
+  --max-seq-len 4096 \
+  --seed 42
 ```
