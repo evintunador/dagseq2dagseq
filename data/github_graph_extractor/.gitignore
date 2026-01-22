@@ -1,0 +1,24 @@
+# Large data files - these are downloaded/generated and should not be committed
+*.jsonl
+
+# Generated statistics and plots
+*_stats.json
+*_degree_dist.png
+graph_degree_dist.png
+graph_stats.json
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Test files
+test_*.py
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
