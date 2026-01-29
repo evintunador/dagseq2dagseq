@@ -1,13 +1,6 @@
-# dagseq2dagseq
+# Text-Attributed Graph Sequence to Text-Attributed Graph Sequence (TAGSeq2TAGSeq)
 
-This experiment explores training language models on graph-structured data (specifically DAGs from Wiki dumps). It implements custom data loading pipelines that traverse the text-attributed document graph to construct packed sequences.
-
-## Structure
-
-- `data/`: Contains the custom dataset, sampler, and traversal logic.
-- `demo_traversal.py`: A script to demonstrate and inspect the graph traversal and packing logic without running a full training loop.
-- `main.py`: The primary training script (currently a template).
-- `tunalab.yaml`: Experiment configuration.
+This experiment explores training language models on graph-structured data. It implements custom data loading pipelines that traverse the text-attributed document graph to construct packed sequences.
 
 ## Usage
 
