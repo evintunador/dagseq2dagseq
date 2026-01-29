@@ -4,11 +4,11 @@ from typing import Dict, List
 
 import pytest
 
-from experiments.dagseq2dagseq.data.pack_sampler import (
+from data.pack_sampler import (
     DocPlacement,
     PackBatchSampler,
 )
-from experiments.dagseq2dagseq.data.traversal import RandomSelectionStrategy
+from data.traversal import RandomSelectionStrategy
 
 
 @dataclass
