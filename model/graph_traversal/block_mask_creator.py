@@ -258,20 +258,46 @@ def create_doc_bidirectional_block_mask(tokens: torch.Tensor, doc_spans: List[An
 # Global instance for cross_doc_link (initialized when needed)
 _cross_doc_link_creator = None
 
-def create_cross_doc_link_mask(tokens: torch.Tensor, doc_spans: List[Any], **kwargs) -> BlockMask:
+def create_cross_doc_link_mask(
+    tokens: torch.Tensor, 
+    doc_spans: List[Any], 
+    link_format: str = 'markdown',
+    **kwargs
+) -> BlockMask:
     """
     Creates a cross-document link-aware attention mask.
-    Tokens after markdown links [text](target) can attend to the target document.
+    
+    Uses appropriate link detector based on content format.
+
+    Args:
+        tokens: Token tensor
+        doc_spans: Document span metadata
+        link_format: Type of links in content ('markdown' or 'python_import')
+        **kwargs: Additional batch info
 
     Requires tiktoken to be installed.
     """
     global _cross_doc_link_creator
 
-    if _cross_doc_link_creator is None:
+    if _cross_doc_link_creator is None or not hasattr(_cross_doc_link_creator, '_link_format') or _cross_doc_link_creator._link_format != link_format:
         if tiktoken is None:
             raise ImportError("tiktoken is required for cross_doc_link mask. Install with: pip install tiktoken")
+        
         enc = tiktoken.get_encoding('gpt2')
-        _cross_doc_link_creator = CrossDocLinkMaskCreator(tokenizer_decode_fn=enc.decode)
+        
+        # Create appropriate link detector
+        if link_format == 'python_import':
+            from model.graph_traversal.link_detectors import PythonImportDetector
+            detector = PythonImportDetector()
+        else:  # 'markdown' (default)
+            from model.graph_traversal.link_detectors import MarkdownLinkDetector
+            detector = MarkdownLinkDetector()
+        
+        _cross_doc_link_creator = CrossDocLinkMaskCreator(
+            tokenizer_decode_fn=enc.decode,
+            link_detector=detector
+        )
+        _cross_doc_link_creator._link_format = link_format  # Store for cache check
 
     return _cross_doc_link_creator(tokens, doc_spans, **kwargs)
 
@@ -378,6 +404,16 @@ if __name__ == "__main__":
     graph_index = GraphIndex(args.dataset_dir)
     backend = PretokShardedBackend(graph_index)
     
+    # Load dataset config and formatter (for clean_title support)
+    try:
+        from data.dataset_config import load_config_from_pretokenized_dir
+        dataset_config = load_config_from_pretokenized_dir(args.dataset_dir)
+        formatter = dataset_config.get_formatter()
+        logger.info(f"Loaded dataset config: {dataset_config.name} (format: {dataset_config.title_format})")
+    except (ImportError, FileNotFoundError):
+        logger.warning("No dataset_config.json found or import failed, using default formatter")
+        formatter = None
+    
     # 2. Setup Sampler
     logger.info(f"Initializing sampler with seed {args.seed} and strategy {args.strategy}...")
 
@@ -412,7 +448,8 @@ if __name__ == "__main__":
         backend=backend,
         layout=NullLayoutPolicy(),
         placements=placements,
-        as_2d=True
+        as_2d=True,
+        formatter=formatter  # Pass formatter for clean_title generation
     )
     
     if 'tokens' not in batch and 'input_ids' in batch:
@@ -426,8 +463,32 @@ if __name__ == "__main__":
     logger.info(f"Docs in batch ({len(doc_titles)}): {doc_titles}")
 
     # 4. Create Mask
-    mask_creator_fn = get_mask_creator(args.mask_type)
-    block_mask = mask_creator_fn(tokens, doc_spans)
+    # For cross_doc_link, create a custom mask creator with appropriate detector
+    if args.mask_type == 'cross_doc_link':
+        if tiktoken is None:
+            logger.error("tiktoken is required for cross_doc_link mask")
+            sys.exit(1)
+        
+        enc = tiktoken.get_encoding('gpt2')
+        
+        # Create appropriate link detector based on dataset config
+        link_format = dataset_config.link_format if dataset_config else 'markdown'
+        if link_format == 'python_import':
+            from model.graph_traversal.link_detectors import PythonImportDetector
+            detector = PythonImportDetector()
+        else:
+            from model.graph_traversal.link_detectors import MarkdownLinkDetector
+            detector = MarkdownLinkDetector()
+        
+        mask_creator_instance = CrossDocLinkMaskCreator(
+            tokenizer_decode_fn=enc.decode,
+            link_detector=detector
+        )
+        block_mask = mask_creator_instance(tokens, doc_spans)
+    else:
+        mask_creator_fn = get_mask_creator(args.mask_type)
+        block_mask = mask_creator_fn(tokens, doc_spans)
+    
     logger.info(f"Block mask created using '{args.mask_type}' strategy.")
 
     # 5. Visualization
@@ -463,7 +524,7 @@ if __name__ == "__main__":
     elif args.mask_type == 'cross_doc_link':
         # Use the EXACT same logic as the mask creator by calling its visualization method
         # This ensures 100% consistency between visualization and actual mask
-        dense_mask = _cross_doc_link_creator.build_dense_mask_for_visualization(
+        dense_mask = mask_creator_instance.build_dense_mask_for_visualization(
             tokens, doc_spans, device=torch.device('cpu')
         )
     else:
@@ -471,30 +532,59 @@ if __name__ == "__main__":
         logger.warning(f"No specific visualization logic for mask type '{args.mask_type}'. Using full attention as fallback.")
         dense_mask = torch.ones((input_len, input_len), dtype=torch.bool)
 
-    # Plot
-    plt.figure(figsize=(12, 10))
+    # Plot with enhanced visualization for cross_doc_link
+    plt.figure(figsize=(14, 12) if args.mask_type == 'cross_doc_link' else (12, 10))
+    
+    # Use grayscale for all mask types
     plt.imshow(dense_mask.numpy(), cmap='Greys', interpolation='nearest', origin='upper')
     
     # Draw boundaries
+    colors = plt.cm.tab10(np.linspace(0, 1, len(doc_spans)))
     boundaries = []
-    for span in doc_spans:
+    
+    for idx, (span, color) in enumerate(zip(doc_spans, colors)):
         boundaries.append(span.start)
         boundaries.append(span.end)
-        # Label
-        mid = (max(0, span.start) + min(input_len, span.end)) / 2
-        if 0 <= mid < input_len:
-            plt.text(mid, -1, span.title[:15], ha='center', rotation=45, color='red', fontsize=8)
-            plt.text(-1, mid, span.title[:15], va='center', color='red', fontsize=8)
+        
+        # Enhanced visualization for cross_doc_link
+        if args.mask_type == 'cross_doc_link':
+            # Draw colored borders
+            plt.axvline(x=span.start - 0.5, color=color, linewidth=2, alpha=0.7)
+            plt.axvline(x=span.end - 0.5, color=color, linewidth=2, alpha=0.7)
+            plt.axhline(y=span.start - 0.5, color=color, linewidth=2, alpha=0.7)
+            plt.axhline(y=span.end - 0.5, color=color, linewidth=2, alpha=0.7)
+            
+            # Add document index labels
+            mid = (max(0, span.start) + min(input_len, span.end)) / 2
+            if 0 <= mid < input_len:
+                label = f"[{idx}] {span.title[:20]}"
+                plt.text(mid, -2, label, ha='center', rotation=45, color=color, 
+                        fontsize=8, weight='bold')
+        else:
+            # Simple blue dashed lines for other mask types
+            mid = (max(0, span.start) + min(input_len, span.end)) / 2
+            if 0 <= mid < input_len:
+                plt.text(mid, -1, span.title[:15], ha='center', rotation=45, 
+                        color='red', fontsize=8)
+                plt.text(-1, mid, span.title[:15], va='center', color='red', fontsize=8)
 
-    valid_bounds = sorted(list(set([b for b in boundaries if 0 <= b <= input_len])))
-    for b in valid_bounds:
-        plt.axhline(y=b - 0.5, color='blue', linestyle='--', linewidth=0.5)
-        plt.axvline(x=b - 0.5, color='blue', linestyle='--', linewidth=0.5)
+    # Draw document boundaries
+    if args.mask_type != 'cross_doc_link':
+        valid_bounds = sorted(list(set([b for b in boundaries if 0 <= b <= input_len])))
+        for b in valid_bounds:
+            plt.axhline(y=b - 0.5, color='blue', linestyle='--', linewidth=0.5)
+            plt.axvline(x=b - 0.5, color='blue', linestyle='--', linewidth=0.5)
 
-    plt.title(f"FlexAttention Mask: {args.mask_type} (Seed={args.seed})")
+    title = f"FlexAttention Mask: {args.mask_type} (Seed={args.seed})"
+    if args.mask_type == 'cross_doc_link':
+        title += "\nGreen = Can Attend, Red = Blocked"
+    plt.title(title, fontsize=12, weight='bold')
+    plt.xlabel('Key/Value Position', fontsize=10)
+    plt.ylabel('Query Position', fontsize=10)
     plt.tight_layout()
     this_dir = os.path.dirname(os.path.abspath(__file__))
     artifacts_dir = os.path.join(this_dir, 'artifacts')
+    os.makedirs(artifacts_dir, exist_ok=True)
     output_img = os.path.join(artifacts_dir, f"mask_viz_{args.mask_type}_seed{args.seed}.png")
     plt.savefig(output_img)
     logger.info(f"Saved visualization to {output_img}")

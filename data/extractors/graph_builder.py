@@ -111,10 +111,15 @@ class GraphBuilder:
             
             # Create node if it doesn't exist
             if normalized_title not in graph:
-                graph[normalized_title] = GraphNode(
+                node = GraphNode(
                     title=normalized_title,
                     char_count=len(doc.content)
                 )
+                # Store mapping from source identifier to normalized title
+                node.metadata['source_identifier'] = doc.identifier
+                # Include any additional metadata from the document
+                node.metadata.update(doc.metadata)
+                graph[normalized_title] = node
             
             # Extract links from content
             raw_links = self.link_extractor.extract_links(doc.content, context)

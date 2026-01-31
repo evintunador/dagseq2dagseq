@@ -165,10 +165,16 @@ class GitHubGraphBuilder(GraphBuilder):
                 # Use repo:path as the key format
                 k = f"{norm_repo}:{file_path}"
                 path_to_key[file_path] = k
-                repo_graph[k] = GraphNode(
+                node = GraphNode(
                     title=k,
                     char_count=len(content)
                 )
+                # Store source identifier as repo_name:file_path (not normalized)
+                # This allows matching back to original JSONL records
+                node.metadata['source_identifier'] = f"{repo_name}:{file_path}"
+                node.metadata['max_stars_repo_name'] = repo_name
+                node.metadata['max_stars_repo_path'] = file_path
+                repo_graph[k] = node
             
             # Resolve imports to actual files and create outgoing edges
             for file_path, imported_modules in file_to_imports.items():
@@ -181,18 +187,20 @@ class GitHubGraphBuilder(GraphBuilder):
                     )
                     # Only add link if target exists and is different from source
                     if target_file and target_file != file_path:
-                        outgoing_links.add(target_file)
+                        # Convert to full repo:path format
+                        target_key = path_to_key.get(target_file)
+                        if target_key:
+                            outgoing_links.add(target_key)
                 
                 if outgoing_links:
                     repo_graph[path_to_key[file_path]].outgoing = outgoing_links
             
             # Compute incoming edges
             for source_key, node in repo_graph.items():
-                source_path = source_key.split(":", 1)[1]
-                for target_file_path in node.outgoing:
-                    target_key = path_to_key.get(target_file_path)
-                    if target_key:
-                        repo_graph[target_key].incoming.add(source_path)
+                for target_key in node.outgoing:
+                    # target_key is now already in full repo:path format
+                    if target_key in repo_graph:
+                        repo_graph[target_key].incoming.add(source_key)
             
             # Check if this repo has any links
             if any(node.outgoing or node.incoming for node in repo_graph.values()):

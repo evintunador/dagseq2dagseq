@@ -16,6 +16,8 @@ from data.traversal import (
     RandomSelectionStrategy,
     RandomWalkStrategy,
 )
+from data.collate import get_title_formatter
+from data.dataset_config import load_config_from_pretokenized_dir
 
 
 logger = logging.getLogger(__name__)
@@ -92,6 +94,20 @@ def main() -> None:
     if not args.dataset_dir.is_dir():
         logger.error("Dataset directory not found: %s", args.dataset_dir)
         return
+
+    # Load dataset config and formatter
+    try:
+        dataset_config = load_config_from_pretokenized_dir(args.dataset_dir)
+        formatter = dataset_config.get_formatter()
+        logger.info(
+            "Loaded dataset config: %s (format: %s)",
+            dataset_config.name,
+            dataset_config.title_format
+        )
+    except FileNotFoundError:
+        logger.warning("No dataset_config.json found, using default flat formatter")
+        from model.title_formats import FlatTitleFormatter
+        formatter = FlatTitleFormatter()
 
     backend: PretokShardedBackend | None = None
     try:

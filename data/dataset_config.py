@@ -23,7 +23,7 @@ class DatasetConfig:
     Attributes:
         name: Human-readable dataset name
         title_format: Type of title formatting ('flat', 'hierarchical', 'colon_separated')
-        title_strategy: How to extract titles from filepaths ('flat', 'hierarchical')
+        link_format: Type of link in content ('markdown', 'python_import', 'latex_cite')
         hash_length: Number of hex characters in uniqueness hash
         path_separator: Character used for hierarchical paths (if applicable)
         description: Optional description of the dataset
@@ -31,7 +31,7 @@ class DatasetConfig:
     
     name: str
     title_format: Literal['flat', 'hierarchical', 'colon_separated']
-    title_strategy: Literal['flat', 'hierarchical']
+    link_format: Literal['markdown', 'python_import'] = 'markdown'
     hash_length: int = 6
     path_separator: str = '/'
     description: Optional[str] = None
@@ -87,7 +87,6 @@ class DatasetConfig:
 WIKIPEDIA_CONFIG = DatasetConfig(
     name="Wikipedia",
     title_format="flat",
-    title_strategy="flat",
     hash_length=6,
     description="Wikipedia articles with flat title structure"
 )
@@ -95,7 +94,7 @@ WIKIPEDIA_CONFIG = DatasetConfig(
 GITHUB_CONFIG = DatasetConfig(
     name="GitHub",
     title_format="colon_separated",
-    title_strategy="hierarchical",
+    link_format="python_import",
     hash_length=6,
     path_separator='/',
     description="GitHub code repositories with repo:path structure"
@@ -104,7 +103,6 @@ GITHUB_CONFIG = DatasetConfig(
 DOCUMENTATION_CONFIG = DatasetConfig(
     name="Documentation",
     title_format="hierarchical",
-    title_strategy="hierarchical",
     hash_length=6,
     path_separator='/',
     description="Documentation with hierarchical path structure"

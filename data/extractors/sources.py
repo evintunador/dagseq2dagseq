@@ -128,3 +128,74 @@ class JSONLSource(ContentSource):
                     content=content or "",
                     metadata=metadata
                 )
+
+
+class GitHubJSONLSource(ContentSource):
+    """
+    Specialized source for GitHub data that constructs repo:path identifiers.
+    
+    Used by GitHub graph extractor to read repository data and construct
+    identifiers in the format "repo_name:file_path" to match graph titles.
+    """
+    
+    def __init__(
+        self,
+        input_file: Path,
+        repo_field: str = "max_stars_repo_name",
+        path_field: str = "max_stars_repo_path",
+        content_field: str = "content"
+    ):
+        """
+        Args:
+            input_file: Path to JSONL file
+            repo_field: JSON field containing repository name
+            path_field: JSON field containing file path
+            content_field: JSON field containing file content
+        """
+        self.input_file = Path(input_file)
+        self.repo_field = repo_field
+        self.path_field = path_field
+        self.content_field = content_field
+        
+        if not self.input_file.exists():
+            raise ValueError(f"Input file does not exist: {self.input_file}")
+    
+    def iter_documents(self) -> Iterator[Document]:
+        """
+        Yield Document for each JSONL line with repo:path identifier.
+        
+        The identifier is constructed as "{repo}:{path}" to match the format
+        used by the GitHub graph builder.
+        """
+        with open(self.input_file, 'r', encoding='utf-8') as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                
+                repo_name = data.get(self.repo_field)
+                file_path = data.get(self.path_field)
+                content = data.get(self.content_field, "")
+                
+                if not repo_name or not file_path:
+                    continue
+                
+                # Construct identifier as repo:path
+                identifier = f"{repo_name}:{file_path}"
+                
+                metadata = {
+                    'repo_name': repo_name,
+                    'file_path': file_path,
+                    'line_number': line_num
+                }
+                
+                yield Document(
+                    identifier=identifier,
+                    content=content or "",
+                    metadata=metadata
+                )

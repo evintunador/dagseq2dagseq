@@ -41,6 +41,31 @@ def extract_title_hierarchical(filepath: str, input_dir: Path) -> str:
     return os.path.splitext(relative_path)[0]
 
 
+def build_source_id_to_title_map(graph_data: dict) -> dict:
+    """
+    Build a mapping from source_identifier to normalized title.
+    
+    The graph stores both the normalized title and the original source_identifier
+    in metadata. This creates a reverse lookup.
+    
+    Args:
+        graph_data: Dictionary of graph nodes keyed by normalized title
+    
+    Returns:
+        Dictionary mapping source_identifier -> normalized title
+    """
+    source_id_to_title = {}
+    
+    for title, node_data in graph_data.items():
+        source_id = node_data.get('source_identifier')
+        if source_id:
+            source_id_to_title[source_id] = title
+        else:
+            logger.warning(f"Graph node '{title}' has no source_identifier in metadata")
+    
+    return source_id_to_title
+
+
 def load_custom_tokenizer(tokenizer_path: Path):
     """Loads a custom tokenizer from a .pkl file."""
     if not tokenizer_path.exists():
@@ -60,26 +85,30 @@ def load_custom_tokenizer(tokenizer_path: Path):
 
 
 def tokenize_worker(
-    filepath: str,
+    doc_tuple: tuple,  # (source_identifier, content)
     queue: mp.Queue,
     encode_fn: Callable[[str], List[int]],
     dtype: np.dtype,
-    input_dir: Path,
-    title_strategy: str,
+    source_id_to_title: dict,
 ):
     """
-    Reads a single markdown file, extracts its title, tokenizes its content,
-    and puts the result onto the queue.
+    Tokenizes a document and puts the result onto the queue.
+    
+    Args:
+        doc_tuple: (source_identifier, content) tuple
+        queue: Multiprocessing queue for results
+        encode_fn: Tokenization function
+        dtype: NumPy dtype for tokens
+        source_id_to_title: Mapping from source identifiers to normalized titles
     """
+    source_id, content = doc_tuple
+    
     try:
-        with open(filepath, 'r', encoding='utf-8') as f:
-            content = f.read()
-        
-        # Extract title based on strategy
-        if title_strategy == 'hierarchical':
-            title = extract_title_hierarchical(filepath, input_dir)
-        else:  # 'flat'
-            title = extract_title_flat(filepath, input_dir)
+        # Look up the normalized title from the graph
+        title = source_id_to_title.get(source_id)
+        if title is None:
+            logger.warning(f"Source identifier '{source_id}' not found in graph, skipping")
+            return
             
         # Clean hashes from links in the text to avoid polluting the model with implementation details.
         # We want [Link](Title) instead of [Link](Title_123456).
@@ -96,7 +125,7 @@ def tokenize_worker(
         queue.put((title, tokens_np))
 
     except Exception as e:
-        logger.error(f"Could not process file {filepath}: {e}")
+        logger.error(f"Could not process document '{source_id}': {e}")
 
 
 def writer_process(
@@ -229,21 +258,6 @@ def finalize_shard(file_handle, total_bytes: int, dtype_str: str):
 def run_preprocessing(args, rep: ReproducibilityManager):
     """The main logic of the preprocessing script, wrapped to be called by the manager."""
     
-    # Determine title extraction strategy
-    if args.title_strategy == 'auto':
-        # Auto-detect based on directory structure
-        # If we find nested directories with .md files, use hierarchical
-        has_nested = False
-        for md_file in args.input_dir.rglob("*.md"):
-            relative = md_file.relative_to(args.input_dir)
-            if len(relative.parts) > 1:  # File is in a subdirectory
-                has_nested = True
-                break
-        title_strategy = 'hierarchical' if has_nested else 'flat'
-        logger.info(f"Auto-detected title strategy: {title_strategy}")
-    else:
-        title_strategy = args.title_strategy
-    
     # --- Setup Logging ---
     # The ReproducibilityManager gives us a unique output directory.
     # We set up our logging to go there.
@@ -295,13 +309,57 @@ def run_preprocessing(args, rep: ReproducibilityManager):
         return
     logger.info(f"Loaded {len(graph_data):,} nodes from graph file.")
 
-    # --- File Discovery ---
-    logger.info("Discovering markdown files...")
-    md_files = sorted(list(args.input_dir.rglob("*.md")))
-    if not md_files:
-        logger.error("No markdown files found in the input directory.")
+    # --- Create Content Source ---
+    logger.info(f"Creating content source (type: {args.source_type})...")
+    
+    if args.source_type == "markdown":
+        from data.extractors.sources import MarkdownFileSource
+        source = MarkdownFileSource(args.input_dir)
+    elif args.source_type == "jsonl":
+        from data.extractors.sources import JSONLSource
+        if not args.input_file:
+            logger.error("--input-file required for jsonl source type")
+            return
+        source = JSONLSource(
+            args.input_file,
+            identifier_field=args.identifier_field,
+            content_field=args.content_field,
+            additional_fields=args.additional_fields or []
+        )
+    elif args.source_type == "github":
+        from data.extractors.sources import GitHubJSONLSource
+        if not args.input_file:
+            logger.error("--input-file required for github source type")
+            return
+        source = GitHubJSONLSource(
+            args.input_file,
+            repo_field=args.repo_field or "max_stars_repo_name",
+            path_field=args.path_field or "max_stars_repo_path",
+            content_field=args.content_field
+        )
+    else:
+        logger.error(f"Unknown source type: {args.source_type}")
         return
-    logger.info(f"Found {len(md_files)} markdown files to process.")
+    
+    # --- Load documents from source ---
+    logger.info("Loading documents from source...")
+    documents = []
+    for doc in source.iter_documents():
+        documents.append((doc.identifier, doc.content))
+    logger.info(f"Loaded {len(documents)} documents from source")
+    
+    # --- Build source_id to title mapping from graph ---
+    logger.info("Building source_id to title mapping from graph...")
+    source_id_to_title = build_source_id_to_title_map(graph_data)
+    logger.info(f"Graph contains {len(source_id_to_title)} source_identifier mappings")
+    
+    # Check how many documents can be mapped
+    mappable = sum(1 for source_id, _ in documents if source_id in source_id_to_title)
+    logger.info(f"Can map {mappable}/{len(documents)} documents to graph titles")
+    
+    if mappable < len(documents):
+        unmapped = len(documents) - mappable
+        logger.warning(f"{unmapped} documents not found in graph and will be skipped")
 
     # --- Multiprocessing Setup ---
     manager = mp.Manager()
@@ -323,7 +381,7 @@ def run_preprocessing(args, rep: ReproducibilityManager):
             graph_data,
             dataset_metadata,
             args.shard_size_gb,
-            len(md_files)
+            len(documents)
         ),
     )
     writer.start()
@@ -334,12 +392,10 @@ def run_preprocessing(args, rep: ReproducibilityManager):
             queue=queue,
             encode_fn=encode_fn,
             dtype=token_dtype,
-            input_dir=args.input_dir,
-            title_strategy=title_strategy,
+            source_id_to_title=source_id_to_title,
         )
         # Using imap_unordered for potentially better performance as results are processed as they complete
-        # A simple pool.map is also fine and was used before.
-        list(tqdm(pool.imap_unordered(worker_fn, md_files), total=len(md_files), desc="Tokenizing"))
+        list(tqdm(pool.imap_unordered(worker_fn, documents), total=len(documents), desc="Tokenizing"))
     
     # --- Signal writer to finish and wait ---
     queue.put((None, None)) # Sentinel value
@@ -347,22 +403,32 @@ def run_preprocessing(args, rep: ReproducibilityManager):
     writer.join()
     logger.info("All processes finished.")
     
-    # --- Save dataset configuration ---
-    # Determine title format from strategy
-    if title_strategy == 'hierarchical':
-        title_format = 'hierarchical'
+    # Determine title and link format from graph content and source type
+    sample_titles = list(graph_data.keys())[:10] if graph_data else []
+    
+    # Auto-detect title format from actual graph titles
+    if any(':' in title for title in sample_titles):
+        title_format = 'colon_separated'  # GitHub style: repo:path
+    elif any('/' in title for title in sample_titles):
+        title_format = 'hierarchical'  # Nested paths
     else:
-        title_format = 'flat'
+        title_format = 'flat'  # Simple names
+    
+    # Auto-detect link format from source type
+    if args.source_type == 'github':
+        link_format = 'python_import'
+    else:
+        link_format = 'markdown'
     
     dataset_config = DatasetConfig(
-        name=args.dataset_name or f"Dataset from {args.input_dir.name}",
+        name=args.dataset_name or f"Dataset from {args.input_dir.name if args.input_dir else args.input_file.name}",
         title_format=title_format,
-        title_strategy=title_strategy,
+        link_format=link_format,
         hash_length=6,
-        description=f"Pretokenized from {args.input_dir}"
+        description=f"Pretokenized from {args.source_type} source"
     )
     save_config_to_pretokenized_dir(dataset_config, Path(rep.output_dir))
-    logger.info(f"Saved dataset configuration: {dataset_config.name}")
+    logger.info(f"Saved dataset configuration: {dataset_config.name} (title: {title_format}, links: {link_format})")
 
 
 def main():
@@ -374,12 +440,53 @@ def main():
     parser.add_argument(
         "input_dir",
         type=Path,
-        help="Directory containing the extracted Markdown files."
+        nargs='?',
+        help="Directory containing source files (for markdown source type)."
     )
     parser.add_argument(
         "graph_file",
         type=Path,
         help="Path to the graph.jsonl file."
+    )
+    parser.add_argument(
+        "--source-type",
+        type=str,
+        choices=['markdown', 'jsonl', 'github'],
+        default='markdown',
+        help="Type of content source: 'markdown' (.md files), 'jsonl' (generic JSON Lines), or 'github' (GitHub repository data)."
+    )
+    parser.add_argument(
+        "--input-file",
+        type=Path,
+        help="Input file path (required for jsonl source type)."
+    )
+    parser.add_argument(
+        "--identifier-field",
+        type=str,
+        default="identifier",
+        help="JSON field to use as document identifier (for jsonl source)."
+    )
+    parser.add_argument(
+        "--content-field",
+        type=str,
+        default="content",
+        help="JSON field containing document content (for jsonl/github source)."
+    )
+    parser.add_argument(
+        "--repo-field",
+        type=str,
+        help="JSON field containing repository name (for github source, default: max_stars_repo_name)."
+    )
+    parser.add_argument(
+        "--path-field",
+        type=str,
+        help="JSON field containing file path (for github source, default: max_stars_repo_path)."
+    )
+    parser.add_argument(
+        "--additional-fields",
+        type=str,
+        nargs='*',
+        help="Additional JSON fields to include in metadata (for jsonl source)."
     )
     parser.add_argument(
         "-o", "--runs-dir",
@@ -412,18 +519,6 @@ def main():
         help=f"Number of worker processes to use (default: {max(1, mp.cpu_count() - 1)})."
     )
     parser.add_argument(
-        "--title-strategy",
-        type=str,
-        choices=['flat', 'hierarchical', 'auto'],
-        default='auto',
-        help=(
-            "How to extract titles from filepaths:\n"
-            "  flat: Use basename only (e.g., 'file.md' -> 'file')\n"
-            "  hierarchical: Use relative path (e.g., 'dir/file.md' -> 'dir/file')\n"
-            "  auto: Detect based on directory structure (default)"
-        )
-    )
-    parser.add_argument(
         "--dataset-name",
         type=str,
         default=None,
@@ -435,6 +530,14 @@ def main():
         help="Suppress progress reporting and info messages."
     )
     args = parser.parse_args()
+
+    # Validate source-type specific arguments
+    if args.source_type == 'markdown':
+        if not args.input_dir:
+            parser.error("input_dir is required for markdown source type")
+    elif args.source_type in ['jsonl', 'github']:
+        if not args.input_file:
+            parser.error(f"--input-file is required for {args.source_type} source type")
 
     # Basic logging setup for messages that happen before the ReproducibilityManager takes over
     log_level = logging.WARNING if args.quiet else logging.INFO
